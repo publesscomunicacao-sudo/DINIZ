@@ -1,0 +1,123 @@
+name: Temporary RedSky public catalog export
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4
+      - name: Export public catalog
+        run: |
+          cat > /tmp/export.py <<'PY'
+          import csv, json, re, html, time
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+
+          API='https://api.redskydrop.com'
+          SITE='https://redskydrop.com'
+          OUT=Path('public_export'); OUT.mkdir(exist_ok=True)
+          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0','Accept':'application/json,text/plain,*/*'})
+
+          def get_json(path, params=None):
+              r=s.get(f'{API}/{path.lstrip("/")}',params=params,timeout=60)
+              (OUT/(path.strip('/').replace('/','_')+'.headers.txt')).write_text('\n'.join(f'{k}: {v}' for k,v in r.headers.items()),encoding='utf-8')
+              r.raise_for_status(); return r.json(),r.url
+
+          payload,url=get_json('produtos/public/catalog',{'skip':0,'take':999999})
+          (OUT/'catalog_raw.json').write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding='utf-8')
+          data=payload.get('data',payload)
+          items=data.get('items',data if isinstance(data,list) else [])
+          if not isinstance(items,list): raise RuntimeError(f'Unexpected catalog shape: {type(items)}')
+
+          try:
+              cp,curl=get_json('categorias/public',{'skip':0,'take':9999999})
+              (OUT/'categories_raw.json').write_text(json.dumps(cp,ensure_ascii=False,indent=2),encoding='utf-8')
+              cd=cp.get('data',cp); cats=cd.get('items',cd if isinstance(cd,list) else [])
+          except Exception as e:
+              cats=[]; (OUT/'categories_error.txt').write_text(str(e))
+          catmap={str(x.get('id')):x.get('nome','') for x in cats if isinstance(x,dict)}
+
+          def text(v):
+              if v is None:return ''
+              return html.unescape(re.sub(r'\s+',' ',BeautifulSoup(str(v),'html.parser').get_text(' ',strip=True))).strip()
+          def images(p):
+              v=p.get('fotos') or []
+              if isinstance(v,str):
+                  try:v=json.loads(v)
+                  except:v=[v]
+              if isinstance(v,dict):v=list(v.values())
+              out=[]
+              for x in v if isinstance(v,list) else []:
+                  if isinstance(x,dict):
+                      for kind in ('image','thumb'):
+                          u=x.get(kind)
+                          if u:
+                              if not u.startswith('http'):u=f'{API}/{u.lstrip("/")}'
+                              if u not in out:out.append(u)
+                  elif x:
+                      u=str(x)
+                      if not u.startswith('http'):u=f'{API}/{u.lstrip("/")}'
+                      if u not in out:out.append(u)
+              return out
+          def price(v):
+              if v in (None,''):return None
+              if isinstance(v,(int,float)):return float(v)
+              z=re.sub(r'[^0-9,.-]','',str(v))
+              if ',' in z and '.' in z:z=z.replace('.','').replace(',','.')
+              elif ',' in z:z=z.replace(',','.')
+              try:return float(z)
+              except:return None
+
+          rows=[]; image_rows=[]
+          all_keys=sorted({k for p in items if isinstance(p,dict) for k in p.keys()})
+          for p in items:
+              if not isinstance(p,dict):continue
+              imgs=images(p); pid=p.get('id'); cid=p.get('categoria_id') or p.get('categoriaid')
+              row={
+                'id':pid,'nome':p.get('nome',''),'preco':price(p.get('preco')),
+                'sku':p.get('sku') or p.get('codigo') or p.get('codigo_integracao') or '',
+                'descricao':text(p.get('descricao') or p.get('descricao_curta')),
+                'descricao_html':p.get('descricao') or p.get('descricao_curta') or '',
+                'categoria_id':cid or '','categoria':catmap.get(str(cid),''),
+                'estoque':p.get('estoque',''),'situacao':p.get('situacao',''),
+                'preco_sugerido':price(p.get('preco_sugestao')),
+                'gtin_ean':p.get('gtin_ean',''),'codigo_integracao':p.get('codigo_integracao',''),
+                'url_catalogo':f'{SITE}/catalog','url_api_catalogo':url,
+                'imagem_principal':imgs[0] if imgs else '',
+                'links_imagens':' | '.join(imgs),'quantidade_imagens':len(imgs),
+              }
+              rows.append(row)
+              for j,u in enumerate(imgs,1):image_rows.append({'id':pid,'sku':row['sku'],'nome':row['nome'],'ordem':j,'url_imagem':u,'principal':j==1})
+          rows.sort(key=lambda x:(str(x['nome']).lower(),str(x['id'])))
+
+          fields=list(rows[0].keys()) if rows else []
+          with (OUT/'products.csv').open('w',newline='',encoding='utf-8-sig') as f:
+              w=csv.DictWriter(f,fieldnames=fields);w.writeheader();w.writerows(rows)
+          with (OUT/'images.csv').open('w',newline='',encoding='utf-8-sig') as f:
+              w=csv.DictWriter(f,fieldnames=['id','sku','nome','ordem','url_imagem','principal']);w.writeheader();w.writerows(image_rows)
+          (OUT/'products.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          report={'generated_at_utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),'source':url,'total_api':data.get('total') if isinstance(data,dict) else None,'products':len(rows),'images':len(image_rows),'missing_sku':sum(not r['sku'] for r in rows),'missing_price':sum(r['preco'] is None for r in rows),'missing_description':sum(not r['descricao'] for r in rows),'missing_images':sum(not r['quantidade_imagens'] for r in rows),'duplicate_ids':len(rows)-len({str(r['id']) for r in rows}),'raw_fields':all_keys,'category_count':len(cats)}
+          (OUT/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(report,ensure_ascii=False))
+          PY
+          python /tmp/export.py
+      - name: Upload export
+        uses: actions/upload-artifact@v4
+        with:
+          name: redsky-public-catalog
+          path: public_export/
+          retention-days: 1
+          if-no-files-found: error
