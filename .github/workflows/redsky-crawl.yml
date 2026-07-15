@@ -1,0 +1,322 @@
+name: Temporary RedSky catalog crawl
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install crawler dependencies
+        run: python -m pip install --quiet requests beautifulsoup4
+      - name: Crawl complete catalog
+        env:
+          API_BASE: https://api.redskydrop.com
+          SITE_BASE: https://redskydrop.com
+        run: |
+          cat > /tmp/crawl_redsky.py <<'PY'
+          import csv
+          import json
+          import os
+          import re
+          import time
+          import html
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+
+          API_BASE = os.environ['API_BASE'].rstrip('/')
+          SITE_BASE = os.environ['SITE_BASE'].rstrip('/')
+          OUT = Path('output')
+          RAW = OUT / 'raw_pages'
+          OUT.mkdir(exist_ok=True)
+          RAW.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (compatible; RedSkyCatalogAudit/1.0)',
+              'Accept': 'application/json,text/plain,*/*',
+          })
+
+          def request_json(url, params=None, attempts=4, timeout=45):
+              last = None
+              for attempt in range(attempts):
+                  try:
+                      response = session.get(url, params=params, timeout=timeout)
+                      response.raise_for_status()
+                      return response.json(), response.url, response.status_code
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(1.2 * (attempt + 1))
+              raise RuntimeError(f'GET failed: {url} params={params}: {last}')
+
+          def unwrap(payload):
+              data = payload.get('data', payload) if isinstance(payload, dict) else payload
+              if isinstance(data, list):
+                  return data
+              if isinstance(data, dict):
+                  for key in ('items', 'results', 'products', 'produtos', 'rows'):
+                      if isinstance(data.get(key), list):
+                          return data[key]
+              return []
+
+          # Paginate until the API returns no new records. Increment by the actual
+          # number returned so server-side page-size caps do not truncate the crawl.
+          all_list_items = []
+          seen = set()
+          skip = 0
+          requested_take = 100
+          page = 1
+          pagination_log = []
+          while page <= 200:
+              payload, final_url, status = request_json(
+                  f'{API_BASE}/produtos',
+                  params={'skip': skip, 'take': requested_take, 'situacao': 'active'},
+              )
+              (RAW / f'products_page_{page:03d}.json').write_text(
+                  json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8'
+              )
+              items = unwrap(payload)
+              ids = []
+              new_items = []
+              for item in items:
+                  if not isinstance(item, dict):
+                      continue
+                  pid = item.get('id')
+                  key = str(pid) if pid is not None else json.dumps(item, ensure_ascii=False, sort_keys=True)
+                  ids.append(pid)
+                  if key not in seen:
+                      seen.add(key)
+                      new_items.append(item)
+                      all_list_items.append(item)
+              pagination_log.append({
+                  'page': page, 'skip': skip, 'requested_take': requested_take,
+                  'returned': len(items), 'new': len(new_items), 'ids': ids,
+                  'url': final_url, 'status': status,
+              })
+              if not items or not new_items:
+                  break
+              skip += len(items)
+              page += 1
+
+          # Retrieve every individual product endpoint to obtain complete SKU,
+          # description and image arrays even when the list endpoint is abbreviated.
+          def detail_for(item):
+              pid = item.get('id')
+              if pid is None:
+                  return item, {'id': None, 'ok': False, 'error': 'missing id'}
+              try:
+                  payload, final_url, status = request_json(f'{API_BASE}/produtos/{pid}')
+                  detail = payload.get('data', payload) if isinstance(payload, dict) else payload
+                  if isinstance(detail, dict) and isinstance(detail.get('produto'), dict):
+                      detail = detail['produto']
+                  if not isinstance(detail, dict):
+                      detail = {}
+                  merged = dict(item)
+                  merged.update(detail)
+                  return merged, {'id': pid, 'ok': True, 'url': final_url, 'status': status}
+              except Exception as exc:
+                  return item, {'id': pid, 'ok': False, 'error': str(exc)}
+
+          detailed = []
+          detail_log = []
+          with ThreadPoolExecutor(max_workers=16) as pool:
+              futures = [pool.submit(detail_for, item) for item in all_list_items]
+              for future in as_completed(futures):
+                  product, log = future.result()
+                  detailed.append(product)
+                  detail_log.append(log)
+
+          def sort_key(product):
+              value = product.get('id')
+              try:
+                  return (0, int(value))
+              except Exception:
+                  return (1, str(value or ''))
+          detailed.sort(key=sort_key)
+          detail_log.sort(key=lambda x: sort_key(x))
+
+          # Inspect deployed frontend bundles for the current detail-route pattern.
+          frontend = {'catalog_status': None, 'catalog_url': f'{SITE_BASE}/catalog', 'scripts': [], 'route_candidates': []}
+          chosen_pattern = '/catalog/{id}'
+          try:
+              response = requests.get(f'{SITE_BASE}/catalog', timeout=45, headers={'User-Agent': session.headers['User-Agent']})
+              frontend['catalog_status'] = response.status_code
+              frontend['catalog_final_url'] = response.url
+              frontend['catalog_html_bytes'] = len(response.content)
+              (OUT / 'catalog_snapshot.html').write_bytes(response.content)
+              soup = BeautifulSoup(response.text, 'html.parser')
+              script_urls = [urljoin(response.url, tag.get('src')) for tag in soup.find_all('script') if tag.get('src')]
+              frontend['scripts'] = script_urls
+              route_hits = set()
+              for script_url in script_urls[:80]:
+                  try:
+                      js = requests.get(script_url, timeout=30, headers={'User-Agent': session.headers['User-Agent']})
+                      if js.status_code != 200 or len(js.content) > 12_000_000:
+                          continue
+                      text = js.text
+                      for pattern in re.findall(r'/(?:catalog|product|products|dashboard/products)/[^"\'`\\]{0,80}', text):
+                          route_hits.add(pattern[:160])
+                  except Exception:
+                      pass
+              frontend['route_candidates'] = sorted(route_hits)
+              joined = '\n'.join(frontend['route_candidates'])
+              if '/catalog/' in joined:
+                  chosen_pattern = '/catalog/{id}'
+              elif '/products/' in joined:
+                  chosen_pattern = '/products/{id}'
+              elif '/product/' in joined:
+                  chosen_pattern = '/product/{id}'
+              elif '/dashboard/products/' in joined:
+                  chosen_pattern = '/dashboard/products/{id}'
+          except Exception as exc:
+              frontend['error'] = str(exc)
+          frontend['chosen_detail_pattern'] = chosen_pattern
+
+          def plain_description(value):
+              if value is None:
+                  return ''
+              text = str(value)
+              soup = BeautifulSoup(text, 'html.parser')
+              cleaned = soup.get_text(' ', strip=True)
+              return html.unescape(re.sub(r'\s+', ' ', cleaned)).strip()
+
+          def normalize_images(product):
+              values = product.get('fotos') or product.get('images') or []
+              if isinstance(values, str):
+                  try:
+                      parsed = json.loads(values)
+                      values = parsed if isinstance(parsed, list) else [values]
+                  except Exception:
+                      values = [v.strip() for v in re.split(r'[,;\n]', values) if v.strip()]
+              if isinstance(values, dict):
+                  values = list(values.values())
+              if not isinstance(values, list):
+                  values = []
+              label = product.get('label_image')
+              if label:
+                  values.append(label)
+              out = []
+              for value in values:
+                  if isinstance(value, dict):
+                      value = value.get('url') or value.get('src') or value.get('location')
+                  if not value:
+                      continue
+                  value = str(value).strip()
+                  if value.startswith('//'):
+                      value = 'https:' + value
+                  elif value.startswith('/'):
+                      value = 'https://red-sky-drop.s3.sa-east-1.amazonaws.com' + value
+                  elif not re.match(r'^https?://', value):
+                      value = 'https://red-sky-drop.s3.sa-east-1.amazonaws.com/' + value.lstrip('/')
+                  if value not in out:
+                      out.append(value)
+              return out
+
+          def numeric_price(value):
+              if value is None or value == '':
+                  return None
+              if isinstance(value, (int, float)):
+                  return float(value)
+              text = re.sub(r'[^0-9,.-]', '', str(value))
+              if ',' in text and '.' in text:
+                  text = text.replace('.', '').replace(',', '.')
+              elif ',' in text:
+                  text = text.replace(',', '.')
+              try:
+                  return float(text)
+              except Exception:
+                  return None
+
+          products = []
+          image_rows = []
+          for product in detailed:
+              pid = product.get('id')
+              images = normalize_images(product)
+              description_html = '' if product.get('descricao') is None else str(product.get('descricao'))
+              row = {
+                  'id': pid,
+                  'nome': product.get('nome') or product.get('name') or '',
+                  'preco': numeric_price(product.get('preco') if 'preco' in product else product.get('price')),
+                  'sku': product.get('sku') or '',
+                  'descricao': plain_description(description_html),
+                  'descricao_html': description_html,
+                  'estoque': product.get('estoque') if product.get('estoque') is not None else product.get('stock'),
+                  'situacao': product.get('situacao') or ('active' if product.get('ativo') or product.get('ativado') else ''),
+                  'categoria_id': product.get('categoriaid') or product.get('categoria_id') or '',
+                  'subcategoria_id': product.get('subcategoriaid') or product.get('subcategoria_id') or '',
+                  'marca_id': product.get('marcaid') or product.get('marca_id') or '',
+                  'codigo_integracao': product.get('codigo_integracao') or '',
+                  'gtin_ean': product.get('gtin_ean') or '',
+                  'produtos_bling_id': product.get('produtosBling_id') or product.get('produtos_bling_id') or '',
+                  'url_produto': f"{SITE_BASE}{chosen_pattern.format(id=pid)}" if pid is not None else '',
+                  'url_api': f'{API_BASE}/produtos/{pid}' if pid is not None else '',
+                  'imagem_principal': images[0] if images else '',
+                  'links_imagens': ' | '.join(images),
+                  'quantidade_imagens': len(images),
+              }
+              products.append(row)
+              for index, image_url in enumerate(images, start=1):
+                  image_rows.append({
+                      'id': pid, 'sku': row['sku'], 'nome': row['nome'],
+                      'ordem': index, 'url_imagem': image_url,
+                      'principal': index == 1,
+                  })
+
+          product_fields = [
+              'id','nome','preco','sku','descricao','descricao_html','estoque','situacao',
+              'categoria_id','subcategoria_id','marca_id','codigo_integracao','gtin_ean',
+              'produtos_bling_id','url_produto','url_api','imagem_principal','links_imagens','quantidade_imagens'
+          ]
+          with (OUT / 'products.csv').open('w', newline='', encoding='utf-8-sig') as handle:
+              writer = csv.DictWriter(handle, fieldnames=product_fields)
+              writer.writeheader(); writer.writerows(products)
+          with (OUT / 'images.csv').open('w', newline='', encoding='utf-8-sig') as handle:
+              writer = csv.DictWriter(handle, fieldnames=['id','sku','nome','ordem','url_imagem','principal'])
+              writer.writeheader(); writer.writerows(image_rows)
+          (OUT / 'products.json').write_text(json.dumps(products, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'raw_products_detailed.json').write_text(json.dumps(detailed, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          report = {
+              'generated_at_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+              'source_catalog': f'{SITE_BASE}/catalog',
+              'api_base': API_BASE,
+              'list_records_unique': len(all_list_items),
+              'detail_records': len(detailed),
+              'products_exported': len(products),
+              'images_exported': len(image_rows),
+              'products_without_sku': sum(1 for p in products if not p['sku']),
+              'products_without_price': sum(1 for p in products if p['preco'] is None),
+              'products_without_description': sum(1 for p in products if not p['descricao']),
+              'products_without_images': sum(1 for p in products if not p['quantidade_imagens']),
+              'duplicate_ids': len(detailed) - len({str(p.get('id')) for p in detailed}),
+              'pagination': pagination_log,
+              'detail_requests': detail_log,
+              'frontend': frontend,
+          }
+          (OUT / 'crawl_report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps({k: report[k] for k in (
+              'products_exported','images_exported','products_without_sku',
+              'products_without_price','products_without_description','products_without_images'
+          )}, ensure_ascii=False))
+          PY
+          python /tmp/crawl_redsky.py
+      - name: Upload crawl result
+        uses: actions/upload-artifact@v4
+        with:
+          name: redsky-catalog-data
+          path: output/
+          retention-days: 1
+          if-no-files-found: error
