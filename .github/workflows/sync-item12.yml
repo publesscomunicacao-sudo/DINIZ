@@ -1,0 +1,76 @@
+name: Sync Item 12 Home Office
+
+on:
+  push:
+    paths:
+      - '.github/workflows/sync-item12.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-item-12:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Patch Item 12 and regenerate Worker
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+
+          const driveUrl = 'https://drive.google.com/file/d/1lldTHL327zTLISoGUaPHyx5NYhADL4pt/view?usp=drivesdk';
+          let html = fs.readFileSync('index.html', 'utf8');
+
+          const oldBlock = `            { 
+                id: 12, 
+                title: "Política de Home Office e Trabalho Híbrido", 
+                category: "adm", 
+                icon: "fa-laptop-house", 
+                docUrl: "",
+                availabilityMessage: "O documento oficial desta política ainda não está disponível na pasta de políticas internas.",
+                objective: "Regulamentar o trabalho flexível mantendo eficiência, segurança e equilíbrio.",
+                fullText: ""
+            },`;
+
+          const newBlock = `            { 
+                id: 12, 
+                title: "Política de Home Office e Trabalho Híbrido", 
+                category: "adm", 
+                icon: "fa-laptop-house", 
+                docUrl: "${driveUrl}",
+                objective: "Regulamentar o trabalho flexível mantendo eficiência, segurança e equilíbrio.",
+                fullText: ""
+            },`;
+
+          if (html.includes(oldBlock)) {
+            html = html.replace(oldBlock, newBlock);
+          } else if (!html.includes(newBlock)) {
+            throw new Error('Item 12 não encontrado no formato esperado; abortando para não alterar conteúdo indevido.');
+          }
+
+          fs.writeFileSync('index.html', html, 'utf8');
+
+          const currentWorker = fs.readFileSync('worker.js', 'utf8');
+          const marker = ';\n\nexport default';
+          const suffixStart = currentWorker.indexOf(marker);
+          if (suffixStart < 0) throw new Error('Estrutura do worker.js não reconhecida.');
+          const suffix = currentWorker.slice(suffixStart);
+          const worker = 'const HTML = ' + JSON.stringify(html) + suffix;
+          fs.writeFileSync('worker.js', worker, 'utf8');
+          NODE
+
+      - name: Commit synchronized source
+        shell: bash
+        run: |
+          if git diff --quiet -- index.html worker.js; then
+            echo "Source already synchronized."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.html worker.js
+          git commit -m "fix: disponibiliza política de home office no onboarding"
+          git push
