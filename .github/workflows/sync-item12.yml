@@ -24,31 +24,22 @@ jobs:
           const driveUrl = 'https://drive.google.com/file/d/1lldTHL327zTLISoGUaPHyx5NYhADL4pt/view?usp=drivesdk';
           let html = fs.readFileSync('index.html', 'utf8');
 
-          const oldBlock = `            { 
-                id: 12, 
-                title: "Política de Home Office e Trabalho Híbrido", 
-                category: "adm", 
-                icon: "fa-laptop-house", 
-                docUrl: "",
-                availabilityMessage: "O documento oficial desta política ainda não está disponível na pasta de políticas internas.",
-                objective: "Regulamentar o trabalho flexível mantendo eficiência, segurança e equilíbrio.",
-                fullText: ""
-            },`;
+          const titleMarker = 'title: "Política de Home Office e Trabalho Híbrido"';
+          const titleIndex = html.indexOf(titleMarker);
+          if (titleIndex < 0) throw new Error('Item 12 não encontrado.');
 
-          const newBlock = `            { 
-                id: 12, 
-                title: "Política de Home Office e Trabalho Híbrido", 
-                category: "adm", 
-                icon: "fa-laptop-house", 
-                docUrl: "${driveUrl}",
-                objective: "Regulamentar o trabalho flexível mantendo eficiência, segurança e equilíbrio.",
-                fullText: ""
-            },`;
+          const blockStart = html.lastIndexOf('{', titleIndex);
+          const endMarker = '\n            },';
+          const blockEndStart = html.indexOf(endMarker, titleIndex);
+          if (blockStart < 0 || blockEndStart < 0) throw new Error('Limites do Item 12 não encontrados.');
+          const blockEnd = blockEndStart + endMarker.length;
 
-          if (html.includes(oldBlock)) {
-            html = html.replace(oldBlock, newBlock);
-          } else if (!html.includes(newBlock)) {
-            throw new Error('Item 12 não encontrado no formato esperado; abortando para não alterar conteúdo indevido.');
+          let block = html.slice(blockStart, blockEnd);
+          if (!block.includes(driveUrl)) {
+            if (!block.includes('docUrl: ""')) throw new Error('docUrl vazio do Item 12 não encontrado.');
+            block = block.replace('docUrl: ""', `docUrl: "${driveUrl}"`);
+            block = block.replace(/\n\s*availabilityMessage: "O documento oficial desta política ainda não está disponível na pasta de políticas internas\.\",?/, '');
+            html = html.slice(0, blockStart) + block + html.slice(blockEnd);
           }
 
           fs.writeFileSync('index.html', html, 'utf8');
